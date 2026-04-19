@@ -84,8 +84,14 @@ Do fixes first as a batch, then replies/resolves after the push so "fixed in `<s
 
 ### Phase 5 - Decide whether to loop
 
-- If you pushed fix commits, the PR has a new HEAD. Copilot does **not** auto re-review new pushes. Go back to Phase 1 with a fresh `cycle_started_at`. This is the core of the loop.
+- If you pushed fix commits, the PR has a new HEAD. **Copilot does NOT auto re-review new pushes.** You MUST explicitly trigger the next cycle:
+  1. Set a fresh `cycle_started_at = $(date -u +"%Y-%m-%dT%H:%M:%SZ")`.
+  2. **Call `request_copilot_review` again.** This is not optional. Without it, Copilot stays away and `check_copilot_review_status` will return `status:"absent"` forever.
+  3. If `request_copilot_review` returns `{requested:true}`, go to Phase 2.
+  4. If it returns `{requested:false}` with a not-a-collaborator hint, exit per exit condition #5 — do NOT proceed to Phase 2 and wait, Copilot is never coming.
 - If you pushed no fixes (all threads were disagreements or clarifications), do NOT loop — same commit yields the same comments. Exit.
+
+**Hard rule:** NEVER call `check_copilot_review_status` or `wait_for_copilot_review` in a new cycle before calling `request_copilot_review` in that cycle. If you find yourself waiting and `check_copilot_review_status` returns `absent`, that means you skipped the request — stop waiting, call `request_copilot_review`, then retry the check.
 
 ## Exit condition
 
