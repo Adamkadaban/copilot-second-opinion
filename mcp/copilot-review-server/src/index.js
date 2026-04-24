@@ -25,6 +25,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ListPromptsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
@@ -531,7 +533,7 @@ async function enableCopilotAutoReview({
 
 const server = new Server(
   { name: "copilot-review-mcp", version: "0.2.0" },
-  { capabilities: { tools: {} } },
+  { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
 const TOOLS = [
@@ -665,6 +667,14 @@ const TOOLS = [
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
+}));
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  resources: [],
+}));
+
+server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+  prompts: [],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
