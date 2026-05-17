@@ -1,0 +1,51 @@
+{
+  "name": "copilot-second-opinion",
+  "version": "0.4.0",
+  "description": "OpenCode plugin + MCP server + skill that runs an automated GitHub Copilot PR review loop: request review, wait deterministically via `gh run watch`, triage every comment, push fixes, reply, resolve, gated merge. Solves the silent-fail of github_request_copilot_review and the no-gating footgun of github_merge_pull_request.",
+  "type": "module",
+  "exports": {
+    "./server": {
+      "import": "./plugin/index.js"
+    }
+  },
+  "files": [
+    "plugin",
+    "mcp",
+    "skill",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "node -e \"import('./plugin/index.js').then(m => { if (!m.CopilotReviewPlugin && !m.default) throw new Error('plugin entry missing'); console.log('plugin import ok'); })\"",
+    "mcp:smoke": "echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"smoke\",\"version\":\"1\"}}}' | node mcp/copilot-review-server/src/index.js"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "mcp",
+    "mcp-server",
+    "github",
+    "copilot",
+    "code-review",
+    "pull-request",
+    "agent-skill"
+  ],
+  "author": "Adam Hassan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Adamkadaban/copilot-second-opinion.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Adamkadaban/copilot-second-opinion/issues"
+  },
+  "homepage": "https://github.com/Adamkadaban/copilot-second-opinion#readme",
+  "engines": {
+    "node": ">=18",
+    "opencode": ">=1.14.22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  }
+}
