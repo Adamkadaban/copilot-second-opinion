@@ -10,9 +10,9 @@
   },
   "files": [
     "plugin",
-    "mcp",
+    "mcp/copilot-review-server/src",
+    "mcp/copilot-review-server/package.json",
     "skill",
-    "install.sh",
     "README.md",
     "LICENSE"
   ],
