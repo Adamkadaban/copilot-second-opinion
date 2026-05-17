@@ -1083,6 +1083,38 @@ server.setRequestHandler(ListPromptsRequestSchema, async () => ({
   prompts: [],
 }));
 
+// Per-tool budgets (ms). opencode's MCP `timeout` is server-wide, so without
+// these every tool would inherit the longest one (15min for waiting on a
+// Copilot review). A hung `gh api` call during a snappy status check would
+// then block the agent for 15 minutes. These budgets fail-fast instead.
+// `wait_for_copilot_review` is excluded — it manages its own timing via the
+// `timeout_sec` arg.
+const TOOL_TIMEOUTS_MS = {
+  request_copilot_review: 30_000,
+  check_copilot_review_status: 30_000,
+  get_copilot_threads: 60_000,
+  reply_to_review_comment: 30_000,
+  resolve_review_thread: 30_000,
+  enable_copilot_auto_review: 60_000,
+  safe_merge_pr: 120_000,
+  // wait_for_copilot_review: handled internally
+};
+
+function withTimeout(promise, ms, toolName) {
+  if (!ms) return promise;
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new Error(
+          `tool ${toolName} exceeded its ${ms}ms server-side budget (likely a hung gh API call). Retry, or check 'gh auth status' / network.`,
+        ),
+      );
+    }, ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   const { name, arguments: args = {} } = req.params;
   const progressToken = req.params._meta?.progressToken;
@@ -1095,38 +1127,37 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     : null;
 
   try {
-    let result;
+    let work;
     switch (name) {
       case "request_copilot_review":
-        result = await requestCopilotReview(args);
+        work = requestCopilotReview(args);
         break;
       case "check_copilot_review_status":
-        result = await checkCopilotReviewStatus(args);
+        work = checkCopilotReviewStatus(args);
         break;
       case "wait_for_copilot_review":
-        result = await waitForCopilotReview(args, {
-          sendProgress,
-          progressToken,
-        });
+        // No outer timeout — uses its own `timeout_sec` arg internally
+        work = waitForCopilotReview(args, { sendProgress, progressToken });
         break;
       case "get_copilot_threads":
-        result = await getCopilotThreads(args);
+        work = getCopilotThreads(args);
         break;
       case "reply_to_review_comment":
-        result = await replyToReviewComment(args);
+        work = replyToReviewComment(args);
         break;
       case "resolve_review_thread":
-        result = await resolveReviewThread(args);
+        work = resolveReviewThread(args);
         break;
       case "enable_copilot_auto_review":
-        result = await enableCopilotAutoReview(args);
+        work = enableCopilotAutoReview(args);
         break;
       case "safe_merge_pr":
-        result = await safeMergePr(args);
+        work = safeMergePr(args);
         break;
       default:
         throw new Error(`unknown tool: ${name}`);
     }
+    const result = await withTimeout(work, TOOL_TIMEOUTS_MS[name], name);
     return {
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
     };
