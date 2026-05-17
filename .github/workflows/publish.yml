@@ -1,0 +1,47 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write # required for npm provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Sanity-check plugin import
+        run: npm run check
+
+      - name: Sanity-check MCP server initialize handshake
+        run: |
+          out=$(npm run --silent mcp:smoke | head -1)
+          echo "$out"
+          echo "$out" | grep -q '"protocolVersion"' || { echo "MCP server did not respond to initialize"; exit 1; }
+
+      - name: Upgrade npm (>=11.5.1 required for Trusted Publishing)
+        run: npm install -g npm@latest
+
+      - name: Publish to npm (Trusted Publishing + provenance)
+        run: |
+          # Remove setup-node's auto-generated .npmrc so npm uses OIDC, not a placeholder token
+          rm -f "$NPM_CONFIG_USERCONFIG"
+          npm publish --provenance --access public
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

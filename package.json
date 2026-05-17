@@ -1,6 +1,6 @@
 {
   "name": "copilot-second-opinion",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "OpenCode plugin + MCP server + skill that runs an automated GitHub Copilot PR review loop: request review, wait deterministically via `gh run watch`, triage every comment, push fixes, reply, resolve, gated merge. Solves the silent-fail of github_request_copilot_review and the no-gating footgun of github_merge_pull_request.",
   "type": "module",
   "exports": {
@@ -19,6 +19,10 @@
   "scripts": {
     "check": "node -e \"import('./plugin/index.js').then(m => { if (!m.CopilotReviewPlugin && !m.default) throw new Error('plugin entry missing'); console.log('plugin import ok'); })\"",
     "mcp:smoke": "echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"smoke\",\"version\":\"1\"}}}' | node mcp/copilot-review-server/src/index.js"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "keywords": [
     "opencode",

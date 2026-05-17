@@ -1,51 +1,55 @@
-<h1 align="center">copilot-second-opinion</h1>
+# copilot-second-opinion
 
-<p align="center">
-  OpenCode plugin + MCP server + agent skill that runs the full GitHub Copilot PR review loop — request review, wait deterministically, triage, fix, reply, resolve, repeat, and merge with safety gates.
-</p>
+[![npm version](https://img.shields.io/npm/v/copilot-second-opinion.svg)](https://www.npmjs.com/package/copilot-second-opinion)
+[![npm downloads](https://img.shields.io/npm/dm/copilot-second-opinion.svg)](https://www.npmjs.com/package/copilot-second-opinion)
+[![license](https://img.shields.io/npm/l/copilot-second-opinion.svg)](./LICENSE)
 
-<p align="center">
-  <a href="https://www.npmjs.com/package/copilot-second-opinion"><img alt="npm version" src="https://img.shields.io/npm/v/copilot-second-opinion.svg"></a>
-  <a href="https://www.npmjs.com/package/copilot-second-opinion"><img alt="npm downloads" src="https://img.shields.io/npm/dm/copilot-second-opinion.svg"></a>
-  <a href="./LICENSE"><img alt="License" src="https://img.shields.io/npm/l/copilot-second-opinion.svg"></a>
-</p>
+OpenCode plugin + MCP server + agent skill that runs the full GitHub Copilot PR review loop — request review, wait deterministically, triage every comment, push fixes, reply, resolve, repeat, and merge with safety gates.
 
----
+## What it does
+
+- **`request_copilot_review`** — POSTs Copilot as a reviewer and **verifies** the request took effect by re-reading `requested_reviewers`. The built-in `github_request_copilot_review` returns HTTP 200 even when Copilot isn't actually added; this one catches the silent-fail.
+- **`wait_for_copilot_review`** — blocks via `gh run watch` on the Copilot Actions workflow run for the head SHA. No blind polling. Falls back to REST polling for older repos.
+- **`get_copilot_threads`** / **`reply_to_review_comment`** / **`resolve_review_thread`** — full thread lifecycle with both the GraphQL `thread_id` and the REST `comment_id` returned in one shot.
+- **`enable_copilot_auto_review`** — idempotently creates the repo ruleset that auto-requests Copilot on new PRs.
+- **`safe_merge_pr`** — gated merge: blocks unless Copilot has reviewed the current HEAD, all threads are resolved, and all checks are green. Replaces `github_merge_pull_request`, which does none of that.
+- **`copilot-second-opinion` skill** — the playbook the agent loads to drive the loop. Auto-discoverable on phrases like "address the Copilot comments" or "Copilot didn't re-review after my push".
 
 ## Why
 
-OpenCode (and Claude Code, and friends) ship `github_request_copilot_review` and `github_merge_pull_request` out of the box. Both are footguns:
+OpenCode's built-in GitHub MCP tools have two footguns this package fixes:
 
-- **`github_request_copilot_review`** silently no-ops when Copilot code review isn't enabled on the repo. GitHub returns HTTP 200, so the agent thinks the request worked and waits forever for a review that's never coming.
-- **`github_merge_pull_request`** does zero gating. It will merge a PR with failed CI, unresolved Copilot threads, or a Copilot review that's for the *previous* HEAD.
-
-This package fixes both, plus packages the full review-loop workflow as a skill the model auto-loads.
-
-## What you get
-
-| Piece | Purpose |
-|---|---|
-| **MCP server** (`copilot-review`) | 8 tools, all with verification logic. `request_copilot_review` actually verifies Copilot was added. `wait_for_copilot_review` blocks on `gh run watch` of the Copilot Actions workflow (no blind polling). `safe_merge_pr` gates merge on review-on-current-HEAD + zero-unresolved-threads + green checks. |
-| **Skill** (`copilot-second-opinion`) | Loaded automatically by the model when you push fixes to a Copilot-reviewed PR, when re-reviews are needed, etc. Documents the full loop, including the exact reason the built-in merge tool is shadowed. |
-| **Plugin shim** (this package) | Installs the skill into `~/.config/opencode/skills/`, registers the MCP server in-memory at session start, and shadows `github_merge_pull_request` so the agent can't fall back to it. |
+1. **`github_request_copilot_review` silently no-ops** when Copilot code review isn't enabled on the repo. GitHub returns HTTP 200, so the agent thinks the request worked and waits forever for a review that's never coming. Across one user's session history (~66k tool calls), the prefixed MCP tools from this package were called zero times because the agent kept finding the broken built-in first — the skill exists in part to shadow it.
+2. **`github_merge_pull_request` does zero gating.** It will happily merge a PR with failed CI, unresolved Copilot threads, or a Copilot review that's only for the previous HEAD.
 
 ## Install
-
-### OpenCode (recommended)
 
 ```bash
 opencode plugin copilot-second-opinion -g
 ```
 
-Installs the npm package globally, adds `"copilot-second-opinion"` to your `opencode.json` plugin array, and on next session start the plugin:
+This installs the package globally and, on next session start, the plugin:
 
 1. Symlinks the skill into `~/.config/opencode/skills/copilot-second-opinion/SKILL.md`.
-2. Registers the MCP server **in-memory** (no `opencode.json` mutation — uninstalling the plugin un-registers it automatically).
+2. Registers the MCP server **in-memory** via the `config()` hook (no `opencode.json` mutation — uninstalling the plugin un-registers it automatically).
 3. Disables the built-in `github_merge_pull_request` so `safe_merge_pr` is the only merge path.
 
-You'll see a log line on first run summarizing what was added.
+Or manually:
 
-#### Opt out of the in-memory config injection
+```bash
+npm install -g copilot-second-opinion
+```
+
+Then add `"copilot-second-opinion"` to the `plugin` array in `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["copilot-second-opinion"]
+}
+```
+
+### Opt out of the in-memory config injection
 
 Some users want full control over their `opencode.json`. Set:
 
@@ -53,9 +57,9 @@ Some users want full control over their `opencode.json`. Set:
 export OPENCODE_COPILOT_REVIEW_NO_AUTOCONFIG=1
 ```
 
-The plugin will still install the skill file, but will skip MCP registration + the tools filter. Add them manually using the snippet from the manual install path below.
+The plugin will still install the skill file, but will skip MCP registration and the tools filter. Add them manually to `opencode.json` instead (snippet in the [manual section](#manual-install-claude-code-or-custom-mcp-hosts)).
 
-### Manual install (Claude Code, custom MCP hosts, or OpenCode users who prefer file-based config)
+### Manual install (Claude Code or custom MCP hosts)
 
 ```bash
 git clone https://github.com/Adamkadaban/copilot-second-opinion
@@ -63,12 +67,12 @@ cd copilot-second-opinion
 ./install.sh
 ```
 
-Copies the skill into the first existing of `~/.config/opencode/skills/`, `~/.claude/skills/`, or `~/.opencode/skill/`. Runs `npm install` for the MCP server. Prints the exact config snippet to paste into your MCP host's config.
+The bash installer copies the skill into the first existing of `~/.config/opencode/skills/`, `~/.claude/skills/`, or `~/.opencode/skill/`, runs `npm install` for the MCP server, and prints the exact config snippet to paste into your MCP host.
 
 ## Requirements
 
 - Node 18+
-- `gh` CLI authenticated (`gh auth status` returns a green check)
+- [`gh`](https://cli.github.com/) CLI authenticated (`gh auth status` returns a green check)
 - Copilot code review enabled on the target repo. If it isn't, the first `request_copilot_review` call will return `{requested: false, hint: "..."}` and the skill will offer to enable it via repository ruleset.
 
 ## Usage
@@ -80,24 +84,24 @@ Inside an OpenCode session, the skill is auto-discoverable. Any of these will tr
 > Copilot didn't re-review after my last push
 > merge PR 42 if Copilot is happy and checks pass
 
-The agent will load the skill, run the full loop, and use `safe_merge_pr` for the final merge.
+The agent will load the skill, run the loop, and use `safe_merge_pr` for the final merge.
 
-## What the MCP server exposes
+## Tools
 
 | Tool | Purpose |
 |---|---|
-| `request_copilot_review` | POSTs Copilot as a reviewer + **verifies** the request took effect (re-reads `requested_reviewers`) |
+| `request_copilot_review` | POST Copilot as a reviewer + **verify** the request took effect |
 | `check_copilot_review_status` | Non-blocking snapshot: `done` / `pending` / `absent` for the current HEAD |
-| `wait_for_copilot_review` | Blocking wait via `gh run watch` on the Copilot Actions workflow — deterministic, not poll-based. Falls back to REST polling on older repos. |
-| `get_copilot_threads` | Lists unresolved + non-outdated review threads with both `thread_id` (for resolve) and `root_comment_id` (for reply) |
+| `wait_for_copilot_review` | Blocking wait via `gh run watch`, with REST-poll fallback for older repos |
+| `get_copilot_threads` | List unresolved threads with both `thread_id` and `root_comment_id` |
 | `reply_to_review_comment` | Post a reply to a specific review comment |
-| `resolve_review_thread` | Resolve a review thread via GraphQL `resolveReviewThread` |
-| `enable_copilot_auto_review` | Create/update a repo ruleset with the `copilot_code_review` rule (idempotent) |
-| `safe_merge_pr` | Gated merge: blocks unless Copilot review is current, all threads resolved, all checks green. `force: true` overrides with audit trail. |
+| `resolve_review_thread` | Resolve a thread via GraphQL `resolveReviewThread` |
+| `enable_copilot_auto_review` | Create/update the repo ruleset with `copilot_code_review` (idempotent) |
+| `safe_merge_pr` | Gated merge — blocks unless review, threads, and checks all pass |
 
-Each tool has its own server-side timeout budget (30s–120s) so a hung `gh` call can't block the whole session.
+Each tool has its own server-side timeout budget (30s–120s) so a hung `gh` call can't block the full session.
 
-## Hacking on it
+## Development
 
 ```bash
 git clone https://github.com/Adamkadaban/copilot-second-opinion
@@ -118,11 +122,14 @@ Then add `"copilot-second-opinion"` to your `plugin` array in `opencode.json`.
 
 ## Releasing
 
+Releases are automated via GitHub Actions. To cut a new release:
+
 ```bash
-npm version patch && git push --follow-tags
+npm version patch   # or minor / major
+git push --follow-tags
 ```
 
-The [publish workflow](./.github/workflows/publish.yml) handles npm publish with provenance + GitHub Release.
+The [publish workflow](./.github/workflows/publish.yml) sanity-checks the plugin + MCP server, publishes to npm with [provenance](https://docs.npmjs.com/generating-provenance-statements) via Trusted Publishing, and creates a GitHub Release with auto-generated notes.
 
 ## License
 
