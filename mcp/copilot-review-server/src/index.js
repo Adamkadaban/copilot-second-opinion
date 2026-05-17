@@ -138,25 +138,30 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // produce the workflow run) fall back to the original poll loop.
 
 async function findCopilotRun(owner, repo, headSha) {
+  // Workflow name varies across Copilot rollouts ("Copilot", "Copilot code
+  // review", etc.) but the runs always use `event: dynamic` and a `name`
+  // containing "copilot". Filter on commit, then match defensively.
   try {
     const runs = await ghJson([
       "run",
       "list",
       "--repo",
       `${owner}/${repo}`,
-      "--workflow",
-      "Copilot",
       "--commit",
       headSha,
       "--json",
-      "databaseId,status,conclusion,headSha,createdAt,url",
+      "databaseId,status,conclusion,headSha,createdAt,url,event,name,workflowName",
       "--limit",
-      "10",
+      "30",
     ]);
     if (!Array.isArray(runs)) return null;
-    const matches = runs.filter((r) => r.headSha === headSha);
+    const matches = runs.filter((r) => {
+      if (r.headSha !== headSha) return false;
+      if (r.event !== "dynamic") return false;
+      const name = `${r.name || ""} ${r.workflowName || ""}`.toLowerCase();
+      return name.includes("copilot");
+    });
     if (!matches.length) return null;
-    // Most recent first
     matches.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     return matches[0];
   } catch {
