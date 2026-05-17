@@ -129,6 +129,82 @@ function isCopilotRequested(prData) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---------- Copilot workflow-run helpers ----------
+//
+// Modern Copilot PR review is implemented as a real GitHub Actions workflow run
+// named "Running Copilot Code Review" under workflow `Copilot` (event: dynamic).
+// That means we can deterministically wait on it with `gh run watch` instead of
+// blind-polling the REST reviews endpoint. Older repos (or rollouts that don't
+// produce the workflow run) fall back to the original poll loop.
+
+async function findCopilotRun(owner, repo, headSha) {
+  try {
+    const runs = await ghJson([
+      "run",
+      "list",
+      "--repo",
+      `${owner}/${repo}`,
+      "--workflow",
+      "Copilot",
+      "--commit",
+      headSha,
+      "--json",
+      "databaseId,status,conclusion,headSha,createdAt,url",
+      "--limit",
+      "10",
+    ]);
+    if (!Array.isArray(runs)) return null;
+    const matches = runs.filter((r) => r.headSha === headSha);
+    if (!matches.length) return null;
+    // Most recent first
+    matches.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    return matches[0];
+  } catch {
+    return null;
+  }
+}
+
+async function watchRun(owner, repo, runId, { sendProgress, progressToken } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(
+      "gh",
+      [
+        "run",
+        "watch",
+        String(runId),
+        "--repo",
+        `${owner}/${repo}`,
+        "--exit-status",
+        "--interval",
+        "3",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const start = Date.now();
+    const progressTimer = setInterval(() => {
+      if (sendProgress && progressToken !== undefined) {
+        const elapsed = Math.round((Date.now() - start) / 1000);
+        sendProgress({
+          progressToken,
+          progress: elapsed,
+          message: `watching Copilot review run ${runId} (${elapsed}s elapsed)`,
+        }).catch(() => {});
+      }
+    }, 10000);
+    // Drain to avoid backpressure
+    child.stdout.on("data", () => {});
+    child.stderr.on("data", () => {});
+    child.on("close", (code) => {
+      clearInterval(progressTimer);
+      resolve({ exit_code: code });
+    });
+    child.on("error", () => {
+      clearInterval(progressTimer);
+      resolve({ exit_code: -1 });
+    });
+  });
+}
+
 // ---------- tool implementations ----------
 
 async function requestCopilotReview({ owner, repo, pr, mark_ready = true }) {
@@ -268,22 +344,83 @@ async function checkCopilotReviewStatus({ owner, repo, pr, since_iso }) {
 }
 
 async function waitForCopilotReview(
-  { owner, repo, pr, timeout_sec = 600, poll_interval_sec = 20, since_iso },
-  { sendProgress, progressToken },
+  {
+    owner,
+    repo,
+    pr,
+    timeout_sec = 600,
+    poll_interval_sec = 20,
+    since_iso,
+    prefer_run_watch = true,
+    run_discovery_timeout_sec = 60,
+  },
+  { sendProgress, progressToken } = {},
 ) {
   const start = Date.now();
   const deadline = start + timeout_sec * 1000;
-  let attempts = 0;
-  let lastStatus = null;
 
+  // Fast path: maybe already done.
+  let lastStatus = await checkCopilotReviewStatus({ owner, repo, pr, since_iso });
+  if (lastStatus.status === "done") {
+    return { ...lastStatus, method: "already-done", attempts: 1 };
+  }
+  const headSha = lastStatus.head_sha;
+
+  // Deterministic path: discover a Copilot workflow run, then `gh run watch` it.
+  if (prefer_run_watch) {
+    const discoverDeadline = Math.min(
+      start + run_discovery_timeout_sec * 1000,
+      deadline,
+    );
+    let run = null;
+    while (Date.now() < discoverDeadline) {
+      run = await findCopilotRun(owner, repo, headSha);
+      if (run) break;
+      if (sendProgress && progressToken !== undefined) {
+        const elapsed = Math.round((Date.now() - start) / 1000);
+        await sendProgress({
+          progressToken,
+          progress: elapsed,
+          total: timeout_sec,
+          message: `discovering Copilot workflow run for ${headSha.slice(0, 7)} (${elapsed}s)`,
+        }).catch(() => {});
+      }
+      await sleep(3000);
+    }
+
+    if (run) {
+      if (run.status !== "completed") {
+        await watchRun(owner, repo, run.databaseId, { sendProgress, progressToken });
+      }
+      // Give the review API a beat to register the submitted review after the
+      // run closes — GitHub posts it as a side-effect of the run finishing.
+      for (let i = 0; i < 5; i++) {
+        const after = await checkCopilotReviewStatus({ owner, repo, pr, since_iso });
+        if (after.status === "done") {
+          return {
+            ...after,
+            method: "run-watch",
+            run_id: run.databaseId,
+            run_url: run.url,
+            attempts: 1,
+          };
+        }
+        await sleep(2000);
+      }
+      // Fall through to poll loop if the review never materialized
+    }
+  }
+
+  // Fallback: classic poll loop (older repos / non-pipeline Copilot deployments).
+  let attempts = 0;
   while (Date.now() < deadline) {
     attempts++;
     lastStatus = await checkCopilotReviewStatus({ owner, repo, pr, since_iso });
     if (lastStatus.status === "done") {
-      return { ...lastStatus, attempts };
+      return { ...lastStatus, method: "poll", attempts };
     }
     if (lastStatus.status === "absent") {
-      return { ...lastStatus, attempts };
+      return { ...lastStatus, method: "poll", attempts };
     }
 
     if (sendProgress && progressToken !== undefined) {
@@ -292,7 +429,7 @@ async function waitForCopilotReview(
         progressToken,
         progress: elapsed,
         total: timeout_sec,
-        message: `waiting for Copilot review (attempt ${attempts}, ${elapsed}s elapsed)`,
+        message: `waiting for Copilot review (poll attempt ${attempts}, ${elapsed}s elapsed)`,
       }).catch(() => {});
     }
 
@@ -301,6 +438,7 @@ async function waitForCopilotReview(
 
   return {
     status: "timeout",
+    method: "poll",
     timeout_sec,
     attempts,
     last_status: lastStatus,
@@ -529,10 +667,224 @@ async function enableCopilotAutoReview({
   };
 }
 
+// ---------- safe merge ----------
+//
+// Gates merging on (a) Copilot review submitted for the current HEAD, (b) zero
+// unresolved Copilot threads, (c) all check runs and commit statuses green.
+// Replaces use of github_merge_pull_request — that built-in does no gating and
+// will happily merge a PR with failed checks, ignored Copilot review, or open
+// review threads. Disable it in opencode.json:
+//   "tools": { "github_merge_pull_request": false }
+
+async function getCheckSummary(owner, repo, headSha) {
+  const failed = [];
+  let pending = 0;
+  let total = 0;
+
+  // Check runs (modern Actions / Apps)
+  try {
+    let page = 1;
+    while (true) {
+      const resp = await ghJson([
+        "api",
+        `repos/${owner}/${repo}/commits/${headSha}/check-runs?per_page=100&page=${page}`,
+      ]);
+      const runs = resp?.check_runs || [];
+      if (!runs.length) break;
+      for (const c of runs) {
+        total++;
+        if (c.status !== "completed") {
+          pending++;
+          failed.push({
+            kind: "check_run",
+            name: c.name,
+            status: c.status,
+            conclusion: c.conclusion,
+            url: c.html_url,
+          });
+        } else if (!["success", "neutral", "skipped"].includes(c.conclusion)) {
+          failed.push({
+            kind: "check_run",
+            name: c.name,
+            status: c.status,
+            conclusion: c.conclusion,
+            url: c.html_url,
+          });
+        }
+      }
+      if (runs.length < 100) break;
+      page++;
+    }
+  } catch (e) {
+    failed.push({ kind: "error", source: "check_runs", message: e.message });
+  }
+
+  // Legacy commit statuses (CircleCI etc. that haven't moved to check-runs)
+  try {
+    const status = await ghJson([
+      "api",
+      `repos/${owner}/${repo}/commits/${headSha}/status`,
+    ]);
+    for (const s of status?.statuses || []) {
+      total++;
+      if (s.state === "pending") {
+        pending++;
+        failed.push({
+          kind: "status",
+          name: s.context,
+          state: s.state,
+          url: s.target_url,
+        });
+      } else if (s.state !== "success") {
+        failed.push({
+          kind: "status",
+          name: s.context,
+          state: s.state,
+          url: s.target_url,
+        });
+      }
+    }
+  } catch (e) {
+    failed.push({ kind: "error", source: "statuses", message: e.message });
+  }
+
+  return { ok: failed.length === 0, total, pending, failed };
+}
+
+async function safeMergePr({
+  owner,
+  repo,
+  pr,
+  merge_method = "squash",
+  commit_title,
+  commit_message,
+  delete_branch = false,
+  require_copilot_review = true,
+  require_threads_resolved = true,
+  require_checks_pass = true,
+  force = false,
+}) {
+  if (!["merge", "squash", "rebase"].includes(merge_method)) {
+    throw new Error(`merge_method must be merge|squash|rebase, got ${merge_method}`);
+  }
+
+  const prData = await getPr(owner, repo, pr);
+  const headSha = prData.head.sha;
+  const gates = {};
+
+  // Gate: PR is mergeable from GitHub's perspective
+  gates.pr_state = {
+    ok: prData.state === "open" && prData.draft !== true,
+    state: prData.state,
+    draft: prData.draft,
+    mergeable: prData.mergeable,
+    mergeable_state: prData.mergeable_state,
+  };
+
+  // Gate: Copilot review done on HEAD
+  if (require_copilot_review) {
+    const status = await checkCopilotReviewStatus({ owner, repo, pr });
+    const ok =
+      status.status === "done" && status.commit_id === headSha;
+    gates.copilot_review = {
+      ok,
+      status: status.status,
+      review_commit_id: status.commit_id,
+      head_sha: headSha,
+      submitted_at: status.submitted_at,
+    };
+    if (!ok) {
+      gates.copilot_review.hint =
+        status.status === "done"
+          ? `Latest Copilot review is for commit ${status.commit_id?.slice(0, 7)}, but HEAD is ${headSha.slice(0, 7)}. Push triggered a new HEAD — request a fresh Copilot review and wait for it.`
+          : "Copilot has not submitted a review for the current HEAD. Run request_copilot_review then wait_for_copilot_review before merging.";
+    }
+  }
+
+  // Gate: no unresolved Copilot threads
+  if (require_threads_resolved) {
+    const { count, threads } = await getCopilotThreads({
+      owner,
+      repo,
+      pr,
+      include_resolved: false,
+      include_outdated: false,
+    });
+    gates.threads_resolved = {
+      ok: count === 0,
+      unresolved_count: count,
+      unresolved: threads.slice(0, 10).map((t) => ({
+        thread_id: t.thread_id,
+        path: t.path,
+        line: t.line,
+        url: t.url,
+        body_preview: (t.body || "").slice(0, 120),
+      })),
+    };
+    if (count > 0) {
+      gates.threads_resolved.hint =
+        "Reply to each Copilot thread with your decision and call resolve_review_thread before merging. If you genuinely disagree, reply with your reasoning then resolve.";
+    }
+  }
+
+  // Gate: checks pass
+  if (require_checks_pass) {
+    const summary = await getCheckSummary(owner, repo, headSha);
+    gates.checks_pass = summary;
+    if (!summary.ok) {
+      gates.checks_pass.hint =
+        summary.pending > 0
+          ? `${summary.pending} checks still running. Wait for them before merging.`
+          : "One or more required checks failed. Fix them before merging.";
+    }
+  }
+
+  const allOk = Object.values(gates).every((g) => g.ok);
+  if (!allOk && !force) {
+    return {
+      merged: false,
+      gates,
+      head_sha: headSha,
+      hint:
+        "One or more merge gates failed. Address them, or pass force=true to override (NOT recommended).",
+    };
+  }
+
+  const mergeArgs = [
+    "pr",
+    "merge",
+    String(pr),
+    "--repo",
+    `${owner}/${repo}`,
+    `--${merge_method}`,
+  ];
+  if (commit_title) mergeArgs.push("--subject", commit_title);
+  if (commit_message) mergeArgs.push("--body", commit_message);
+  if (delete_branch) mergeArgs.push("--delete-branch");
+
+  try {
+    await gh(mergeArgs);
+    return {
+      merged: true,
+      forced: !allOk,
+      gates,
+      head_sha: headSha,
+      merge_method,
+    };
+  } catch (e) {
+    return {
+      merged: false,
+      gates,
+      head_sha: headSha,
+      merge_error: e.message,
+    };
+  }
+}
+
 // ---------- MCP wiring ----------
 
 const server = new Server(
-  { name: "copilot-review-mcp", version: "0.2.0" },
+  { name: "copilot-review-mcp", version: "0.3.0" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -574,7 +926,7 @@ const TOOLS = [
   {
     name: "wait_for_copilot_review",
     description:
-      "Block until Copilot submits a review for the PR's current HEAD SHA, or returns early if Copilot is not requested and has no matching review (status:'absent'). Sends MCP progress notifications each poll to keep the client alive. Default timeout 600s, poll 20s. NOTE: the opencode MCP client has its own per-call timeout — set `\"timeout\": 900000` in opencode.json for this server to use long waits, OR prefer check_copilot_review_status in a caller-side loop.",
+      "Block until Copilot submits a review for the PR's current HEAD SHA. Deterministic: first tries to find the Copilot Actions workflow run for the head SHA (modern pipeline-based Copilot review) and `gh run watch`es it, falling back to REST review polling for older repos. Returns early with status:'absent' if Copilot is not requested and has no matching review. Sends MCP progress notifications. Default timeout 600s. NOTE: opencode MCP client has its own per-call timeout — set `\"timeout\": 900000` on this server in opencode.json for long waits.",
     inputSchema: {
       type: "object",
       properties: {
@@ -582,8 +934,26 @@ const TOOLS = [
         repo: { type: "string" },
         pr: { type: "integer" },
         timeout_sec: { type: "integer", default: 600, minimum: 30 },
-        poll_interval_sec: { type: "integer", default: 20, minimum: 5 },
+        poll_interval_sec: {
+          type: "integer",
+          default: 20,
+          minimum: 5,
+          description: "Used only by the REST poll fallback.",
+        },
         since_iso: { type: "string" },
+        prefer_run_watch: {
+          type: "boolean",
+          default: true,
+          description:
+            "If true (default), attempt deterministic `gh run watch` on the Copilot workflow run before falling back to polling. Set false to skip discovery for repos known not to use the pipeline.",
+        },
+        run_discovery_timeout_sec: {
+          type: "integer",
+          default: 60,
+          minimum: 5,
+          description:
+            "How long to wait for the Copilot workflow run to appear before giving up on the deterministic path and falling back to polling.",
+        },
       },
       required: ["owner", "repo", "pr"],
     },
@@ -663,6 +1033,37 @@ const TOOLS = [
       required: ["owner", "repo"],
     },
   },
+  {
+    name: "safe_merge_pr",
+    description:
+      "Merge a PR ONLY if all gates pass: (1) Copilot has submitted a review for the current HEAD, (2) zero unresolved Copilot review threads, (3) all check runs and commit statuses are green. Replaces the built-in `github_merge_pull_request`, which performs no gating. Disable the built-in in opencode.json with `\"tools\": { \"github_merge_pull_request\": false }`. Returns a per-gate verdict; pass `force=true` to override (NOT recommended). Each gate can be individually disabled via require_* flags, but the defaults exist for a reason.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string" },
+        repo: { type: "string" },
+        pr: { type: "integer" },
+        merge_method: {
+          type: "string",
+          enum: ["merge", "squash", "rebase"],
+          default: "squash",
+        },
+        commit_title: { type: "string" },
+        commit_message: { type: "string" },
+        delete_branch: { type: "boolean", default: false },
+        require_copilot_review: { type: "boolean", default: true },
+        require_threads_resolved: { type: "boolean", default: true },
+        require_checks_pass: { type: "boolean", default: true },
+        force: {
+          type: "boolean",
+          default: false,
+          description:
+            "Override failed gates and merge anyway. The response will show `forced:true` and which gates failed. Reserve for genuine emergencies.",
+        },
+      },
+      required: ["owner", "repo", "pr"],
+    },
+  },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -714,6 +1115,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         break;
       case "enable_copilot_auto_review":
         result = await enableCopilotAutoReview(args);
+        break;
+      case "safe_merge_pr":
+        result = await safeMergePr(args);
         break;
       default:
         throw new Error(`unknown tool: ${name}`);

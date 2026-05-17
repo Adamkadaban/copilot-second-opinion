@@ -15,10 +15,11 @@ You are running an iterative review loop with GitHub Copilot as the reviewer. Yo
 - `copilot-review_request_copilot_review(owner, repo, pr, mark_ready?)` — request Copilot as reviewer; flips draft PRs to ready; **verifies the request took effect** and returns `{requested:false, hint:...}` with guidance if Copilot wasn't actually added (most common cause: Copilot code review not enabled on the repo).
 - `copilot-review_enable_copilot_auto_review(owner, repo, include_drafts?, review_on_push?, ruleset_name?)` — creates (or updates) a repository ruleset with the `copilot_code_review` rule so Copilot is auto-requested on every new PR. Idempotent. Use this when `copilot-review_request_copilot_review` returned `{requested:false}` and the user wants the fix applied for them. **Note:** rulesets only apply to PRs opened *after* creation — existing PRs still need manual request (which will now succeed on the next push/new PR).
 - `copilot-review_check_copilot_review_status(owner, repo, pr, since_iso?)` — **non-blocking** snapshot. Returns `{status:'done'|'pending'|'absent', ...}`. Prefer this over `copilot-review_wait_for_copilot_review` — call it in a short loop with `bash: sleep 20` between calls.
-- `copilot-review_wait_for_copilot_review(owner, repo, pr, timeout_sec?, poll_interval_sec?, since_iso?)` — blocks until done/absent/timeout. Only use if the MCP server is configured with a long `"timeout"` in opencode.json (e.g. `900000` ms). Otherwise the MCP client will cut it off.
+- `copilot-review_wait_for_copilot_review(owner, repo, pr, timeout_sec?, poll_interval_sec?, since_iso?, prefer_run_watch?)` — blocks until done/absent/timeout. **Deterministic** on modern repos: discovers the Copilot `Running Copilot Code Review` Actions workflow run for the head SHA and `gh run watch`es it instead of polling. Falls back to REST polling on older repos. Only use if the MCP server is configured with a long `"timeout"` in opencode.json (e.g. `900000` ms). Otherwise the MCP client will cut it off.
 - `copilot-review_get_copilot_threads(owner, repo, pr, include_resolved?, include_outdated?)` — list Copilot's review threads with `thread_id` (for resolving) and `root_comment_id` (for replying).
 - `copilot-review_reply_to_review_comment(owner, repo, pr, comment_id, body)` — post a reply. `comment_id` = `root_comment_id`.
 - `copilot-review_resolve_review_thread(thread_id)` — resolve a thread. `thread_id` = `thread_id` from `copilot-review_get_copilot_threads` (the `PRRT_...` GraphQL node id).
+- `copilot-review_safe_merge_pr(owner, repo, pr, merge_method?, ...)` — **the only correct way to merge a Copilot-reviewed PR.** Gates merge on (1) Copilot review submitted for current HEAD, (2) zero unresolved Copilot threads, (3) all check runs / commit statuses green. The built-in `github_merge_pull_request` is disabled in this user's opencode config precisely because it bypasses these gates — do not look for or attempt to re-enable it.
 
 Supporting tools you already have:
 - `github_pull_request_read` method `get_reviews` / `get_diff` / `get_files` — review summary body and diff context
@@ -41,9 +42,13 @@ Repeat until the exit condition at the end is met. Each pass is one Copilot revi
    - After enabling, note that the ruleset only applies to **new** PRs. For the current PR, retry `copilot-review_request_copilot_review` — it may now succeed, or the user may need to push a new commit / re-open the PR. If it still fails, the user's Copilot subscription or org policy is the blocker; point them at `https://github.com/settings/copilot` or `https://github.com/organizations/<org>/settings/copilot/features`.
    - Otherwise note the returned `head_sha` and proceed.
 
-### Phase 2 - Wait (caller-side poll)
+### Phase 2 - Wait
 
-Prefer the non-blocking pattern to avoid MCP client timeouts:
+Two options. **Default to the deterministic blocking call** unless your MCP client timeout is short:
+
+**Option A — `copilot-review_wait_for_copilot_review` (preferred).** Modern Copilot review runs as a GitHub Actions workflow (`Running Copilot Code Review` under workflow `Copilot`), and this tool watches that run via `gh run watch` — no blind sleep, exits the moment the run completes. Falls back to REST polling on repos where the workflow doesn't appear within 60s. Use this when the MCP server has a long `timeout` configured (≥600 000 ms) in opencode.json.
+
+**Option B — caller-side poll.** If your MCP client cuts off long calls:
 
 1. Call `copilot-review_check_copilot_review_status(owner, repo, pr, since_iso=cycle_started_at)`.
 2. If `status == "pending"`: `bash: sleep 20`, call again. Cap at ~15 iterations (~5 min); if still pending, ask the user whether to keep waiting. Copilot typically takes 30s–3min.
@@ -97,13 +102,26 @@ Do fixes first as a batch, then replies/resolves after the push so "fixed in `<s
 
 ## Exit condition
 
-Stop and summarize when any of these is true:
+Stop looping and proceed to **Phase 6 (Merge)** when any of these is true:
 
 1. A fresh review on the current HEAD produced zero new inline comments.
 2. Two consecutive cycles produced only "disagree" comments (Copilot is stuck).
 3. You've run 5 cycles — ask the user before continuing (each cycle burns a Copilot premium request).
-4. `copilot-review_check_copilot_review_status` returned `absent` with Copilot removed from reviewers (likely quota or config issue).
+4. `copilot-review_check_copilot_review_status` returned `absent` with Copilot removed from reviewers (likely quota or config issue) — do **not** merge automatically in this case; report to the user.
 5. After cycle 1, `copilot-review_request_copilot_review` returns `{requested:false}` with a not-a-collaborator error — the repo requires the ruleset auto-open trigger and won't accept manual re-requests. Report cycle 1 results and stop.
+
+### Phase 6 - Merge
+
+Use **`copilot-review_safe_merge_pr`** — never the built-in `github_merge_pull_request` (it is disabled in this opencode config, and bypasses every safety gate).
+
+1. Call `copilot-review_safe_merge_pr({owner, repo, pr, merge_method: "squash" /* or merge/rebase per repo convention */, delete_branch: true})`.
+2. If `merged: true` → done.
+3. If `merged: false` → inspect the `gates` object. Each failed gate has its own `hint` explaining what to do:
+   - `copilot_review.ok = false` → re-run Phases 1–2 to get a review for the current HEAD.
+   - `threads_resolved.ok = false` → reply + resolve the listed threads, then retry.
+   - `checks_pass.ok = false` → if `pending > 0` wait for CI; if there are real failures, fix them, push, and restart the loop.
+   - `pr_state.ok = false` → the PR is closed, draft, or has a merge conflict; surface to user.
+4. **Never pass `force: true` without explicit user authorization for that specific PR.** A forced merge while gates fail is the exact scenario this tool exists to prevent.
 
 ## Final report
 
@@ -116,6 +134,7 @@ Stop and summarize when any of these is true:
 ## Important rules and gotchas
 
 - **`thread_id` vs `root_comment_id` are different things.** `thread_id` (`PRRT_kwDO...`) is a GraphQL node id — only for `copilot-review_resolve_review_thread`. `root_comment_id` is a numeric REST id — only for `copilot-review_reply_to_review_comment`. `copilot-review_get_copilot_threads` returns both correctly labeled.
+- **Never use `github_merge_pull_request` or `gh pr merge` directly.** The built-in performs no gating — it will merge a PR with failing checks, an outdated Copilot review, or unresolved threads. The built-in is disabled in this opencode config; merging is `copilot-review_safe_merge_pr` only. If you find yourself reaching for `bash: gh pr merge ...`, stop and use the MCP tool.
 - **Copilot doesn't auto re-review new pushes.** Always re-request via `copilot-review_request_copilot_review` after pushing fixes, always pass a fresh `since_iso`.
 - **Ruleset-triggered auto-review fires only on `pull_request.opened`.** Even with `copilot-review_enable_copilot_auto_review` and `review_on_push: true`, the ruleset typically does NOT re-trigger Copilot on pushes to an *existing* PR, nor on close+reopen. In practice, on repos where Copilot isn't a collaborator (the default), **the loop only works for the first review cycle** unless the user has Copilot enabled at the account/org level. After cycle 1, `copilot-review_request_copilot_review` will return `{requested:false}` with a 422 not-a-collaborator error. If that happens, report what was fixed in cycle 1, list remaining threads (if any), and stop — don't push empty commits trying to coax Copilot back.
 - **Always pass `since_iso`** after the first cycle, otherwise `copilot-review_check_copilot_review_status` matches the prior review.
