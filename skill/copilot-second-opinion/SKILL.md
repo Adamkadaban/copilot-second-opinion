@@ -19,7 +19,7 @@ You are running an iterative review loop with GitHub Copilot as the reviewer. Yo
 - `copilot-review_get_copilot_threads(owner, repo, pr, include_resolved?, include_outdated?)` — list Copilot's review threads with `thread_id` (for resolving) and `root_comment_id` (for replying).
 - `copilot-review_reply_to_review_comment(owner, repo, pr, comment_id, body)` — post a reply. `comment_id` = `root_comment_id`.
 - `copilot-review_resolve_review_thread(thread_id)` — resolve a thread. `thread_id` = `thread_id` from `copilot-review_get_copilot_threads` (the `PRRT_...` GraphQL node id).
-- `copilot-review_safe_merge_pr(owner, repo, pr, merge_method?, ...)` — **the only correct way to merge a Copilot-reviewed PR.** Gates merge on (1) Copilot review submitted for current HEAD, (2) zero unresolved Copilot threads, (3) all check runs / commit statuses green. The built-in `github_merge_pull_request` is disabled in this user's opencode config precisely because it bypasses these gates — do not look for or attempt to re-enable it.
+- `copilot-review_safe_merge_pr(owner, repo, pr, merge_method?, ...)` — **the only correct way to merge a Copilot-reviewed PR.** Always-on gates: PR is open + not draft, and Copilot review is **NOT mid-flight** (refuses to merge while Copilot is still working, even if `require_copilot_review=false`). Optional gates (on by default): Copilot review for current HEAD, zero unresolved Copilot threads (with GraphQL→REST propagation-lag retry), all checks green. The built-in `github_merge_pull_request` is disabled in this user's opencode config precisely because it bypasses these gates — do not look for or attempt to re-enable it.
 
 Supporting tools you already have:
 - `github_pull_request_read` method `get_reviews` / `get_diff` / `get_files` — review summary body and diff context
@@ -117,11 +117,12 @@ Use **`copilot-review_safe_merge_pr`** — never the built-in `github_merge_pull
 1. Call `copilot-review_safe_merge_pr({owner, repo, pr, merge_method: "squash" /* or merge/rebase per repo convention */, delete_branch: true})`.
 2. If `merged: true` → done.
 3. If `merged: false` → inspect the `gates` object. Each failed gate has its own `hint` explaining what to do:
+   - `review_not_pending.ok = false` → **always-on gate.** Copilot is mid-review; inline comments are about to land. Wait via `wait_for_copilot_review` or poll `check_copilot_review_status` until `status: "done"`, then retry the merge. **Never pass `force: true` to bypass this** — it's the exact bug that lets merges race ahead of Copilot's inline comments.
    - `copilot_review.ok = false` → re-run Phases 1–2 to get a review for the current HEAD.
-   - `threads_resolved.ok = false` → reply + resolve the listed threads, then retry.
+   - `threads_resolved.ok = false` → reply + resolve the listed threads, then retry. If `propagation_retries` is present in the response, the tool waited for GraphQL to catch up to REST — trust the final count.
    - `checks_pass.ok = false` → if `pending > 0` wait for CI; if there are real failures, fix them, push, and restart the loop.
    - `pr_state.ok = false` → the PR is closed, draft, or has a merge conflict; surface to user.
-4. **Never pass `force: true` without explicit user authorization for that specific PR.** A forced merge while gates fail is the exact scenario this tool exists to prevent.
+4. **Never pass `force: true` without explicit user authorization for that specific PR.** A forced merge while gates fail is the exact scenario this tool exists to prevent. In particular, never use `force: true` to bypass `review_not_pending` — wait for Copilot instead.
 
 ## Final report
 

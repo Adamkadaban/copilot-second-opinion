@@ -777,6 +777,9 @@ async function safeMergePr({
   const headSha = prData.head.sha;
   const gates = {};
 
+  // Fetch Copilot status once — re-used by review_not_pending and copilot_review gates.
+  const status = await checkCopilotReviewStatus({ owner, repo, pr });
+
   // Gate: PR is mergeable from GitHub's perspective
   gates.pr_state = {
     ok: prData.state === "open" && prData.draft !== true,
@@ -786,11 +789,25 @@ async function safeMergePr({
     mergeable_state: prData.mergeable_state,
   };
 
-  // Gate: Copilot review done on HEAD
+  // Gate: Copilot review is not still in-flight. ALWAYS enforced — cannot be
+  // disabled by a require_* flag. Merging while Copilot is mid-review means
+  // inline comments land seconds after the merge and you've silently
+  // bypassed feedback. Even if the caller doesn't care about review content
+  // (require_copilot_review=false), they still don't want this race.
+  // Only `force: true` overrides.
+  gates.review_not_pending = {
+    ok: status.status !== "pending",
+    status: status.status,
+    copilot_still_requested: status.copilot_still_requested,
+  };
+  if (status.status === "pending") {
+    gates.review_not_pending.hint =
+      "Copilot is in requested_reviewers but hasn't submitted a review yet. Wait for it to finish — otherwise inline comments will land seconds after the merge and you'll have silently bypassed feedback. Use wait_for_copilot_review or check_copilot_review_status until status=='done'.";
+  }
+
+  // Gate: Copilot review is for current HEAD (stricter than review_not_pending)
   if (require_copilot_review) {
-    const status = await checkCopilotReviewStatus({ owner, repo, pr });
-    const ok =
-      status.status === "done" && status.commit_id === headSha;
+    const ok = status.status === "done" && status.commit_id === headSha;
     gates.copilot_review = {
       ok,
       status: status.status,
@@ -808,13 +825,35 @@ async function safeMergePr({
 
   // Gate: no unresolved Copilot threads
   if (require_threads_resolved) {
-    const { count, threads } = await getCopilotThreads({
+    // Cross-check against the GraphQL→REST propagation lag. If Copilot's
+    // review for the current HEAD reported N inline comments via REST but
+    // reviewThreads GraphQL returns 0, the thread index hasn't caught up
+    // yet — retry briefly before trusting count==0.
+    let { count, threads } = await getCopilotThreads({
       owner,
       repo,
       pr,
       include_resolved: false,
       include_outdated: false,
     });
+    const reviewMatchesHead =
+      status.status === "done" && status.commit_id === headSha;
+    const restSaysHasComments = (status.comment_count || 0) > 0;
+    let propagation_retries = 0;
+    if (count === 0 && reviewMatchesHead && restSaysHasComments) {
+      for (let i = 0; i < 5; i++) {
+        await sleep(2000);
+        propagation_retries++;
+        ({ count, threads } = await getCopilotThreads({
+          owner,
+          repo,
+          pr,
+          include_resolved: false,
+          include_outdated: false,
+        }));
+        if (count > 0) break;
+      }
+    }
     gates.threads_resolved = {
       ok: count === 0,
       unresolved_count: count,
@@ -826,9 +865,20 @@ async function safeMergePr({
         body_preview: (t.body || "").slice(0, 120),
       })),
     };
+    if (propagation_retries > 0) {
+      gates.threads_resolved.propagation_retries = propagation_retries;
+    }
     if (count > 0) {
       gates.threads_resolved.hint =
         "Reply to each Copilot thread with your decision and call resolve_review_thread before merging. If you genuinely disagree, reply with your reasoning then resolve.";
+    } else if (
+      reviewMatchesHead &&
+      restSaysHasComments &&
+      propagation_retries === 5
+    ) {
+      // We waited for propagation and still got 0 — treat as suspicious.
+      gates.threads_resolved.ok = false;
+      gates.threads_resolved.hint = `Copilot's REST review reports ${status.comment_count} inline comments for HEAD ${headSha.slice(0, 7)}, but the reviewThreads GraphQL endpoint still returns 0 after ${propagation_retries * 2}s. This is the documented propagation lag and means thread data is unreliable — refuse to merge. Wait 30-60s and retry, or inspect the PR manually at ${prData.html_url}.`;
     }
   }
 
@@ -889,7 +939,7 @@ async function safeMergePr({
 // ---------- MCP wiring ----------
 
 const server = new Server(
-  { name: "copilot-review-mcp", version: "0.3.0" },
+  { name: "copilot-review-mcp", version: "0.4.2" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -1041,7 +1091,7 @@ const TOOLS = [
   {
     name: "safe_merge_pr",
     description:
-      "Merge a PR ONLY if all gates pass: (1) Copilot has submitted a review for the current HEAD, (2) zero unresolved Copilot review threads, (3) all check runs and commit statuses are green. Replaces the built-in `github_merge_pull_request`, which performs no gating. Disable the built-in in opencode.json with `\"tools\": { \"github_merge_pull_request\": false }`. Returns a per-gate verdict; pass `force=true` to override (NOT recommended). Each gate can be individually disabled via require_* flags, but the defaults exist for a reason.",
+      "Merge a PR ONLY if all gates pass. Always-on gates (cannot be disabled by require_* flags, only by force=true): (a) PR is open and not draft, (b) Copilot review is NOT mid-flight — refuses to merge while Copilot is still working, even if require_copilot_review=false. Optional gates (default on): (c) Copilot has submitted a review for the current HEAD, (d) zero unresolved Copilot review threads (with GraphQL/REST propagation-lag retry), (e) all check runs and commit statuses are green. Replaces the built-in `github_merge_pull_request`, which performs no gating. Disable the built-in in opencode.json with `\"tools\": { \"github_merge_pull_request\": false }`. Returns a per-gate verdict; pass `force=true` to override (NOT recommended). Each optional gate can be individually disabled via require_* flags, but the always-on review_not_pending gate prevents the most common silent footgun (merging while Copilot's inline comments are still in-flight).",
     inputSchema: {
       type: "object",
       properties: {
