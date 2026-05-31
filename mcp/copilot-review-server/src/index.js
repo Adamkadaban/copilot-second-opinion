@@ -212,6 +212,51 @@ async function watchRun(owner, repo, runId, { sendProgress, progressToken } = {}
 
 // ---------- tool implementations ----------
 
+// Copilot's PR-reviewer bot — stable GraphQL node ID across all repos.
+// Used as the deterministic re-request fallback when the REST path no-ops
+// (which happens consistently when the ruleset's `review_on_push: true`
+// fails to fire — see community/community#186152, IDAHO-VAULT#399).
+const COPILOT_BOT_NODE_ID = "BOT_kgDOCnlnWA";
+
+async function getPrNodeId(owner, repo, pr) {
+  const resp = await ghJson([
+    "api",
+    "graphql",
+    "-f",
+    `query=query($owner:String!,$repo:String!,$pr:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$pr){id}}}`,
+    "-F",
+    `owner=${owner}`,
+    "-F",
+    `repo=${repo}`,
+    "-F",
+    `pr=${pr}`,
+  ]);
+  return resp?.data?.repository?.pullRequest?.id || null;
+}
+
+// GraphQL `requestReviews` with `botIds` is the only programmatic path that
+// reliably re-requests Copilot after it has already submitted a review.
+// REST `POST .../requested_reviewers reviewers[]=Copilot` returns 200 but
+// silently no-ops in this scenario. Verified 5/5 in repeatability testing
+// (commit message in this file's git history for details).
+async function requestCopilotReviewViaGraphql(owner, repo, pr) {
+  const prNodeId = await getPrNodeId(owner, repo, pr);
+  if (!prNodeId) {
+    throw new Error(`could not resolve node id for ${owner}/${repo}#${pr}`);
+  }
+  const mutation = `mutation($pr:ID!,$bots:[ID!]!){requestReviews(input:{pullRequestId:$pr,botIds:$bots,union:true}){pullRequest{id}}}`;
+  await ghJson([
+    "api",
+    "graphql",
+    "-f",
+    `query=${mutation}`,
+    "-F",
+    `pr=${prNodeId}`,
+    "-F",
+    `bots[]=${COPILOT_BOT_NODE_ID}`,
+  ]);
+}
+
 async function requestCopilotReview({ owner, repo, pr, mark_ready = true }) {
   let prData = await getPr(owner, repo, pr);
 
@@ -225,13 +270,16 @@ async function requestCopilotReview({ owner, repo, pr, mark_ready = true }) {
     return {
       requested: true,
       already_requested: true,
+      method: "already-requested",
       head_sha: prData.head.sha,
       was_draft: wasDraft && mark_ready,
     };
   }
 
-  // GitHub silently returns HTTP 200 for `reviewers[]=Copilot` even when
-  // Copilot code review isn't enabled — must verify by re-reading state.
+  // Path A: REST POST requested_reviewers. Works for first-time requests on
+  // repos where Copilot is a configured reviewer. Returns 200 even when it
+  // silently no-ops, so must verify by re-reading.
+  const methodsTried = [];
   let postError = null;
   try {
     await gh([
@@ -242,10 +290,13 @@ async function requestCopilotReview({ owner, repo, pr, mark_ready = true }) {
       "-f",
       "reviewers[]=Copilot",
     ]);
+    methodsTried.push("rest-reviewers-copilot");
   } catch (err) {
     postError = err.message;
   }
 
+  // Path A.2: `gh pr edit --add-reviewer Copilot` fallback if the raw POST
+  // errored. Same semantics, but exercises gh's own URL/handling.
   if (postError) {
     try {
       await gh([
@@ -257,18 +308,45 @@ async function requestCopilotReview({ owner, repo, pr, mark_ready = true }) {
         "--add-reviewer",
         "Copilot",
       ]);
+      methodsTried.push("gh-pr-edit");
       postError = null;
     } catch (err2) {
       postError = `${postError}; fallback gh pr edit also failed: ${err2.message}`;
     }
   }
 
-  const verify = await getPr(owner, repo, pr);
+  let verify = await getPr(owner, repo, pr);
   if (isCopilotRequested(verify)) {
     return {
       requested: true,
+      method: methodsTried[methodsTried.length - 1] || "rest-reviewers-copilot",
+      methods_tried: methodsTried,
       head_sha: verify.head.sha,
       was_draft: wasDraft && mark_ready,
+    };
+  }
+
+  // Path B: GraphQL `requestReviews` with `botIds`. This is the documented
+  // community workaround (community/community#186152, comment by @pacnpal)
+  // and is reliable when REST returns no-op. We always try it before giving
+  // up — verified deterministic in repeatability testing.
+  let graphqlError = null;
+  try {
+    await requestCopilotReviewViaGraphql(owner, repo, pr);
+    methodsTried.push("graphql-botids");
+  } catch (err) {
+    graphqlError = err.message;
+  }
+
+  verify = await getPr(owner, repo, pr);
+  if (isCopilotRequested(verify)) {
+    return {
+      requested: true,
+      method: "graphql-botids",
+      methods_tried: methodsTried,
+      head_sha: verify.head.sha,
+      was_draft: wasDraft && mark_ready,
+      note: "REST path no-opped; recovered via GraphQL requestReviews(botIds:[...]). This is the documented workaround for the review_on_push ruleset glitch (community/community#186152).",
     };
   }
 
@@ -279,15 +357,18 @@ async function requestCopilotReview({ owner, repo, pr, mark_ready = true }) {
 
   return {
     requested: false,
+    method: "all-paths-failed",
+    methods_tried: methodsTried,
     head_sha: verify.head.sha,
     was_draft: wasDraft && mark_ready,
     post_error: postError,
+    graphql_error: graphqlError,
     prior_review_on_head: priorReview
       ? { review_id: priorReview.id, submitted_at: priorReview.submitted_at }
       : null,
     hint: priorReview
       ? "A Copilot review already exists on the current HEAD. Push a new commit before re-requesting, or treat the existing review as the result."
-      : `Could not add Copilot as reviewer on ${owner}/${repo}#${pr}. This almost always means Copilot code review is not enabled for this specific repo — even with a Copilot Pro/Business/Enterprise subscription, Copilot is not a collaborator on new repos by default. TO ENABLE: (1) Per-repo one-off: go to https://github.com/${owner}/${repo}/settings/rules and add a new ruleset targeting the default branch with the rule 'Request pull request review from Copilot', enforcement Active. (2) All your repos: https://github.com/settings/copilot under 'Automatic code review'. (3) For an org: https://github.com/organizations/ORG/settings/copilot/features. DIAGNOSTIC: 'gh api -X POST repos/${owner}/${repo}/pulls/${pr}/requested_reviewers -f reviewers[]=copilot-pull-request-reviewer' returning '422 not a collaborator' confirms Copilot is not enabled here; a 201/200 with Copilot appearing in requested_reviewers confirms it is.`,
+      : `Both the REST POST and the GraphQL requestReviews(botIds) workaround failed to add Copilot as a reviewer on ${owner}/${repo}#${pr}. This almost always means Copilot code review is not enabled for this specific repo — even with a Copilot Pro/Business/Enterprise subscription, Copilot is not a collaborator on new repos by default. TO ENABLE: (1) Per-repo one-off: go to https://github.com/${owner}/${repo}/settings/rules and add a new ruleset targeting the default branch with the rule 'Request pull request review from Copilot', enforcement Active. (2) All your repos: https://github.com/settings/copilot under 'Automatic code review'. (3) For an org: https://github.com/organizations/ORG/settings/copilot/features. As a last resort, click the 🔄 re-request review button next to Copilot in the PR's Reviewers sidebar — that uses an internal endpoint not exposed to any public API.`,
   };
 }
 
@@ -939,7 +1020,7 @@ async function safeMergePr({
 // ---------- MCP wiring ----------
 
 const server = new Server(
-  { name: "copilot-review-mcp", version: "0.4.2" },
+  { name: "copilot-review-mcp", version: "0.5.0" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -947,7 +1028,7 @@ const TOOLS = [
   {
     name: "request_copilot_review",
     description:
-      "Request GitHub Copilot as a reviewer on a PR. Marks draft PRs as ready (opt-out via mark_ready=false). VERIFIES the request actually took effect by re-reading requested_reviewers — returns {requested:false, hint:...} if Copilot wasn't added (common cause: Copilot code review not enabled on the repo).",
+      "Request GitHub Copilot as a reviewer on a PR. Marks draft PRs as ready (opt-out via mark_ready=false). Tries multiple paths: (1) REST POST requested_reviewers with reviewers[]=Copilot, (2) `gh pr edit --add-reviewer Copilot` if REST errored, (3) GraphQL requestReviews(botIds:[Copilot]) — the documented community workaround that reliably re-requests even when REST silently no-ops (the ruleset's review_on_push glitch, see community/community#186152). VERIFIES the request actually took effect by re-reading requested_reviewers after each attempt. Response includes `method` (which path succeeded) and `methods_tried`. Returns {requested:false, hint:...} only if all paths fail.",
     inputSchema: {
       type: "object",
       properties: {
