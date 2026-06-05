@@ -753,6 +753,129 @@ async function enableCopilotAutoReview({
   };
 }
 
+// ---------- diff inspection ----------
+//
+// Copilot reviews the WHOLE PR diff against the base branch on every
+// invocation — there's no "review only the last commit" mode. So a small
+// fix commit on a big PR still triggers a big review (AI credits + Actions
+// minutes). This helper computes the delta between the last Copilot review's
+// commit and the current HEAD so the caller can decide whether the new push
+// is substantive enough to justify another review cycle.
+
+const DOC_FILE_PATTERN =
+  /\.(md|mdx|txt|rst|adoc|asciidoc)$|(^|\/)(README|LICENSE|CHANGELOG|AUTHORS|CONTRIBUTORS|CONTRIBUTING|CODE_OF_CONDUCT|NOTICE|SECURITY)(\.|$)/i;
+
+async function diffSinceLastCopilotReview({ owner, repo, pr }) {
+  const prData = await getPr(owner, repo, pr);
+  const headSha = prData.head.sha;
+  const reviews = await listReviews(owner, repo, pr);
+  const latestAny = latestCopilotReview(reviews, null);
+
+  if (!latestAny) {
+    return {
+      status: "no_prior_review",
+      head_sha: headSha,
+      recommendation: "substantive",
+      hint:
+        "Copilot has never reviewed this PR. The next call to request_copilot_review will be the first cycle.",
+    };
+  }
+
+  const baseSha = latestAny.commit_id;
+
+  if (baseSha === headSha) {
+    return {
+      status: "no_change",
+      head_sha: headSha,
+      base_sha: baseSha,
+      recommendation: "skip",
+      hint:
+        "Current HEAD is the same commit Copilot last reviewed. Re-requesting will produce a duplicate review — skip and either address remaining threads or merge.",
+    };
+  }
+
+  let compare;
+  try {
+    compare = await ghJson([
+      "api",
+      `repos/${owner}/${repo}/compare/${baseSha}...${headSha}`,
+    ]);
+  } catch (err) {
+    return {
+      status: "compare_failed",
+      head_sha: headSha,
+      base_sha: baseSha,
+      recommendation: "substantive",
+      error: err.message,
+      hint:
+        "Couldn't compute the diff (commits may have been force-pushed out of history). Assume substantive and re-request.",
+    };
+  }
+
+  const files = compare?.files || [];
+  const filesChanged = files.length;
+  const additions = files.reduce((s, f) => s + (f.additions || 0), 0);
+  const deletions = files.reduce((s, f) => s + (f.deletions || 0), 0);
+  const totalLines = additions + deletions;
+
+  const codeFiles = files.filter((f) => !DOC_FILE_PATTERN.test(f.filename));
+  const docOnly = codeFiles.length === 0 && filesChanged > 0;
+  const codeLines = codeFiles.reduce(
+    (s, f) => s + (f.additions || 0) + (f.deletions || 0),
+    0,
+  );
+
+  // Heuristics for "trivial". Conservative — bias toward re-reviewing unless
+  // the delta is genuinely tiny. Copilot reviews are non-deterministic so a
+  // re-review can still surface bugs even on a small delta; skipping is a
+  // cost optimization, not a correctness one.
+  const reasons = [];
+  let recommendation = "substantive";
+  if (docOnly) {
+    recommendation = "trivial";
+    reasons.push(
+      `all ${filesChanged} changed file(s) match doc patterns (md/txt/rst/README/LICENSE/...)`,
+    );
+  } else if (codeLines === 0) {
+    recommendation = "trivial";
+    reasons.push("zero code-line changes (only whitespace/renames/binary)");
+  } else if (codeLines <= 10 && codeFiles.length <= 2) {
+    recommendation = "trivial";
+    reasons.push(
+      `tiny code delta (${codeFiles.length} code file(s), ${codeLines} line(s))`,
+    );
+  }
+
+  return {
+    status: "ok",
+    head_sha: headSha,
+    base_sha: baseSha,
+    head_short: headSha.slice(0, 7),
+    base_short: baseSha.slice(0, 7),
+    recommendation,
+    reasons,
+    stats: {
+      files_changed: filesChanged,
+      code_files_changed: codeFiles.length,
+      additions,
+      deletions,
+      total_lines: totalLines,
+      code_lines: codeLines,
+    },
+    files: files.slice(0, 25).map((f) => ({
+      filename: f.filename,
+      status: f.status,
+      additions: f.additions,
+      deletions: f.deletions,
+      is_doc: DOC_FILE_PATTERN.test(f.filename),
+    })),
+    hint:
+      recommendation === "trivial"
+        ? "Delta is small/doc-only. Consider skipping the next review cycle and proceeding to merge if all prior threads are addressed. CAVEAT: Copilot's reviews are non-deterministic; a re-review might surface something missed earlier. This is a cost optimization, not a correctness guarantee."
+        : "Delta is substantive — request Copilot to re-review.",
+  };
+}
+
 // ---------- safe merge ----------
 //
 // Gates merging on (a) Copilot review submitted for the current HEAD, (b) zero
@@ -1020,7 +1143,7 @@ async function safeMergePr({
 // ---------- MCP wiring ----------
 
 const server = new Server(
-  { name: "copilot-review-mcp", version: "0.5.0" },
+  { name: "copilot-review-mcp", version: "0.6.0" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -1170,6 +1293,20 @@ const TOOLS = [
     },
   },
   {
+    name: "diff_since_last_copilot_review",
+    description:
+      "Compute the diff between the commit Copilot last reviewed and the PR's current HEAD. Returns stats (files_changed, additions, deletions, code_lines), per-file breakdown, and a `recommendation` of either 'substantive' (re-request another review), 'trivial' (doc-only or <=10 code lines across <=2 files — consider skipping the next cycle to save AI credits / Actions minutes), 'skip' (HEAD is the same commit as the last review — re-requesting yields a duplicate), or 'substantive' fallback for `no_prior_review` / `compare_failed`. Use BEFORE calling request_copilot_review in a new cycle to avoid wasting cycles on trivial pushes. CAVEAT: Copilot reviews are non-deterministic; skipping is a cost optimization, not a correctness guarantee.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string" },
+        repo: { type: "string" },
+        pr: { type: "integer" },
+      },
+      required: ["owner", "repo", "pr"],
+    },
+  },
+  {
     name: "safe_merge_pr",
     description:
       "Merge a PR ONLY if all gates pass. Always-on gates (cannot be disabled by require_* flags, only by force=true): (a) PR is open and not draft, (b) Copilot review is NOT mid-flight — refuses to merge while Copilot is still working, even if require_copilot_review=false. Optional gates (default on): (c) Copilot has submitted a review for the current HEAD, (d) zero unresolved Copilot review threads (with GraphQL/REST propagation-lag retry), (e) all check runs and commit statuses are green. Replaces the built-in `github_merge_pull_request`, which performs no gating. Disable the built-in in opencode.json with `\"tools\": { \"github_merge_pull_request\": false }`. Returns a per-gate verdict; pass `force=true` to override (NOT recommended). Each optional gate can be individually disabled via require_* flags, but the always-on review_not_pending gate prevents the most common silent footgun (merging while Copilot's inline comments are still in-flight).",
@@ -1227,6 +1364,7 @@ const TOOL_TIMEOUTS_MS = {
   reply_to_review_comment: 30_000,
   resolve_review_thread: 30_000,
   enable_copilot_auto_review: 60_000,
+  diff_since_last_copilot_review: 30_000,
   safe_merge_pr: 120_000,
   // wait_for_copilot_review: handled internally
 };
@@ -1281,6 +1419,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         break;
       case "enable_copilot_auto_review":
         work = enableCopilotAutoReview(args);
+        break;
+      case "diff_since_last_copilot_review":
+        work = diffSinceLastCopilotReview(args);
         break;
       case "safe_merge_pr":
         work = safeMergePr(args);

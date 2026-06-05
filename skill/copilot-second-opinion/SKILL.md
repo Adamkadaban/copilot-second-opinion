@@ -20,6 +20,7 @@ You are running an iterative review loop with GitHub Copilot as the reviewer. Yo
 - `copilot-review_reply_to_review_comment(owner, repo, pr, comment_id, body)` — post a reply. `comment_id` = `root_comment_id`.
 - `copilot-review_resolve_review_thread(thread_id)` — resolve a thread. `thread_id` = `thread_id` from `copilot-review_get_copilot_threads` (the `PRRT_...` GraphQL node id).
 - `copilot-review_safe_merge_pr(owner, repo, pr, merge_method?, ...)` — **the only correct way to merge a Copilot-reviewed PR.** Always-on gates: PR is open + not draft, and Copilot review is **NOT mid-flight** (refuses to merge while Copilot is still working, even if `require_copilot_review=false`). Optional gates (on by default): Copilot review for current HEAD, zero unresolved Copilot threads (with GraphQL→REST propagation-lag retry), all checks green. The built-in `github_merge_pull_request` is disabled in this user's opencode config precisely because it bypasses these gates — do not look for or attempt to re-enable it.
+- `copilot-review_diff_since_last_copilot_review(owner, repo, pr)` — returns the diff between Copilot's last reviewed commit and the current HEAD, with a `recommendation` of `substantive` / `trivial` / `skip` / `no_prior_review`. **Always call this before re-requesting Copilot in a new cycle** to avoid burning AI credits + Actions minutes on trivial pushes (doc-only, ≤10 code lines across ≤2 files, or HEAD === last reviewed commit).
 
 Supporting tools you already have:
 - `github_pull_request_read` method `get_reviews` / `get_diff` / `get_files` — review summary body and diff context
@@ -91,12 +92,22 @@ Do fixes first as a batch, then replies/resolves after the push so "fixed in `<s
 
 ### Phase 5 - Decide whether to loop
 
-- If you pushed fix commits, the PR has a new HEAD. **Copilot does NOT auto re-review new pushes.** You MUST explicitly trigger the next cycle:
-  1. Set a fresh `cycle_started_at = $(date -u +"%Y-%m-%dT%H:%M:%SZ")`.
-   2. **Call `copilot-review_request_copilot_review` again.** This is not optional. Without it, Copilot stays away and `copilot-review_check_copilot_review_status` will return `status:"absent"` forever.
-   3. If `copilot-review_request_copilot_review` returns `{requested:true}`, go to Phase 2.
-   4. If it returns `{requested:false}` with a not-a-collaborator hint, exit per exit condition #5 — do NOT proceed to Phase 2 and wait, Copilot is never coming.
-- If you pushed no fixes (all threads were disagreements or clarifications), do NOT loop — same commit yields the same comments. Exit.
+**Hard cycle cap: 5.** Copilot reviews are expensive (AI credits + Actions minutes) and reviews the WHOLE PR diff every time — not just the latest commit. After cycle 5 you MUST stop and explicitly ask the user whether to continue. Do not silently start cycle 6.
+
+Decision flow when you've pushed fix commits:
+
+1. **Bump the cycle counter.** If you're entering cycle ≥ 6, stop and ask the user: "We've run 5 review cycles on this PR. Want to keep going (will cost more AI credits + Actions minutes) or stop and merge what we have?"
+2. **Call `copilot-review_diff_since_last_copilot_review`** to see if the new push is worth re-reviewing:
+   - `recommendation: "skip"` → HEAD is the same commit Copilot last reviewed. Don't re-request — go to Phase 6 (Merge) if all prior threads are addressed, or exit.
+   - `recommendation: "trivial"` → delta is doc-only or ≤10 code lines across ≤2 files. **Strongly prefer to skip the next cycle** and go to Phase 6. Surface the file list to the user and let them override if they really want another review.
+   - `recommendation: "substantive"` → proceed to step 3.
+   - `recommendation: "no_prior_review"` → first cycle, proceed normally to step 3.
+3. **Set a fresh `cycle_started_at = $(date -u +"%Y-%m-%dT%H:%M:%SZ")`.**
+4. **Call `copilot-review_request_copilot_review`.** This is not optional. Without it, Copilot stays away and `copilot-review_check_copilot_review_status` will return `status:"absent"` forever. The tool now tries 3 paths internally (REST, `gh pr edit`, GraphQL `botIds`) so the documented `review_on_push` ruleset glitch shouldn't bite you — but check the returned `method` field for visibility.
+5. If `copilot-review_request_copilot_review` returns `{requested:true}`, go to Phase 2.
+6. If it returns `{requested:false}` with `methods_tried` including `graphql-botids`, all programmatic paths are exhausted. Exit per exit condition #5 — do NOT proceed to Phase 2 and wait. Tell the user to click the 🔄 re-request review button in the PR's Reviewers sidebar; that's the only remaining path (uses an internal GitHub endpoint not exposed to any public API).
+
+If you pushed no fixes (all threads were disagreements or clarifications), do NOT loop — same commit yields the same comments. Exit.
 
 **Hard rule:** NEVER call `copilot-review_check_copilot_review_status` or `copilot-review_wait_for_copilot_review` in a new cycle before calling `copilot-review_request_copilot_review` in that cycle. If you find yourself waiting and `copilot-review_check_copilot_review_status` returns `absent`, that means you skipped the request — stop waiting, call `copilot-review_request_copilot_review`, then retry the check.
 
@@ -106,9 +117,10 @@ Stop looping and proceed to **Phase 6 (Merge)** when any of these is true:
 
 1. A fresh review on the current HEAD produced zero new inline comments.
 2. Two consecutive cycles produced only "disagree" comments (Copilot is stuck).
-3. You've run 5 cycles — ask the user before continuing (each cycle burns a Copilot premium request).
-4. `copilot-review_check_copilot_review_status` returned `absent` with Copilot removed from reviewers (likely quota or config issue) — do **not** merge automatically in this case; report to the user.
-5. After cycle 1, `copilot-review_request_copilot_review` returns `{requested:false}` with a not-a-collaborator error — the repo requires the ruleset auto-open trigger and won't accept manual re-requests. Report cycle 1 results and stop.
+3. **Hard stop at cycle 5.** Do NOT enter cycle 6 silently — ask the user explicitly. Each cycle re-reviews the entire PR diff (not just the latest commit), so cost scales linearly with cycle count.
+4. `copilot-review_diff_since_last_copilot_review` returned `recommendation: "skip"` or `recommendation: "trivial"` and you've confirmed the prior threads are addressed — re-reviewing would yield no new information.
+5. `copilot-review_check_copilot_review_status` returned `absent` with Copilot removed from reviewers (likely quota or config issue) — do **not** merge automatically in this case; report to the user.
+6. After cycle 1, `copilot-review_request_copilot_review` returns `{requested:false}` with `methods_tried` including `graphql-botids` (all programmatic paths exhausted) — tell the user to click the 🔄 button in the web UI. Report cycle results and stop.
 
 ### Phase 6 - Merge
 
