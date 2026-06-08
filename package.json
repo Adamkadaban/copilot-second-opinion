@@ -1,6 +1,6 @@
 {
   "name": "copilot-second-opinion",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "OpenCode plugin + MCP server + skill that runs an automated GitHub Copilot PR review loop: request review, wait deterministically via `gh run watch`, triage every comment, push fixes, reply, resolve, gated merge. Solves the silent-fail of github_request_copilot_review and the no-gating footgun of github_merge_pull_request.",
   "type": "module",
   "exports": {

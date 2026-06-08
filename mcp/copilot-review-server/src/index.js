@@ -1029,39 +1029,83 @@ async function safeMergePr({
 
   // Gate: no unresolved Copilot threads
   if (require_threads_resolved) {
-    // Cross-check against the GraphQL→REST propagation lag. If Copilot's
-    // review for the current HEAD reported N inline comments via REST but
-    // reviewThreads GraphQL returns 0, the thread index hasn't caught up
-    // yet — retry briefly before trusting count==0.
-    let { count, threads } = await getCopilotThreads({
-      owner,
-      repo,
-      pr,
-      include_resolved: false,
-      include_outdated: false,
-    });
+    // Three states we need to distinguish:
+    //   (a) Some threads unresolved → fail, ask agent to resolve.
+    //   (b) All threads resolved (some resolved threads exist) → pass.
+    //   (c) No threads of any state, but REST review reports inline comments →
+    //       GraphQL `reviewThreads` index hasn't caught up to REST yet
+    //       (propagation lag); retry briefly.
+    //
+    // The pre-v0.6.1 logic conflated (b) and (c): REST `comment_count` is a
+    // count of inline comments on the review record, which DOES NOT decrease
+    // when threads are resolved. So a legitimately fully-resolved PR
+    // (unresolved=0, REST comment_count>0) was misread as propagation lag,
+    // failing the gate forever. Fix: cross-check against include_resolved:true
+    // to confirm threads have indeed propagated before suspecting lag.
+    let { count: unresolvedCount, threads: unresolvedThreads } =
+      await getCopilotThreads({
+        owner,
+        repo,
+        pr,
+        include_resolved: false,
+        include_outdated: false,
+      });
     const reviewMatchesHead =
       status.status === "done" && status.commit_id === headSha;
     const restSaysHasComments = (status.comment_count || 0) > 0;
+
     let propagation_retries = 0;
-    if (count === 0 && reviewMatchesHead && restSaysHasComments) {
-      for (let i = 0; i < 5; i++) {
-        await sleep(2000);
-        propagation_retries++;
-        ({ count, threads } = await getCopilotThreads({
-          owner,
-          repo,
-          pr,
-          include_resolved: false,
-          include_outdated: false,
-        }));
-        if (count > 0) break;
+    let resolved_thread_count = null;
+
+    if (unresolvedCount === 0 && reviewMatchesHead && restSaysHasComments) {
+      // Could be (b) all resolved, or (c) propagation lag. Distinguish by
+      // asking for ALL threads (including resolved + outdated).
+      const allThreads = await getCopilotThreads({
+        owner,
+        repo,
+        pr,
+        include_resolved: true,
+        include_outdated: true,
+      });
+      resolved_thread_count = allThreads.count;
+
+      if (allThreads.count === 0) {
+        // (c) genuine propagation lag — retry up to 10s
+        for (let i = 0; i < 5; i++) {
+          await sleep(2000);
+          propagation_retries++;
+          const probe = await getCopilotThreads({
+            owner,
+            repo,
+            pr,
+            include_resolved: true,
+            include_outdated: true,
+          });
+          if (probe.count > 0) {
+            resolved_thread_count = probe.count;
+            // Re-fetch unresolved subset; if any newly-propagated threads
+            // are unresolved we still want to fail the gate.
+            const refetch = await getCopilotThreads({
+              owner,
+              repo,
+              pr,
+              include_resolved: false,
+              include_outdated: false,
+            });
+            unresolvedCount = refetch.count;
+            unresolvedThreads = refetch.threads;
+            break;
+          }
+        }
       }
+      // else: (b) all threads exist as resolved — gate legitimately passes,
+      // no retry needed.
     }
+
     gates.threads_resolved = {
-      ok: count === 0,
-      unresolved_count: count,
-      unresolved: threads.slice(0, 10).map((t) => ({
+      ok: unresolvedCount === 0,
+      unresolved_count: unresolvedCount,
+      unresolved: unresolvedThreads.slice(0, 10).map((t) => ({
         thread_id: t.thread_id,
         path: t.path,
         line: t.line,
@@ -1069,20 +1113,26 @@ async function safeMergePr({
         body_preview: (t.body || "").slice(0, 120),
       })),
     };
+    if (resolved_thread_count !== null) {
+      gates.threads_resolved.resolved_thread_count = resolved_thread_count;
+    }
     if (propagation_retries > 0) {
       gates.threads_resolved.propagation_retries = propagation_retries;
     }
-    if (count > 0) {
+    if (unresolvedCount > 0) {
       gates.threads_resolved.hint =
         "Reply to each Copilot thread with your decision and call resolve_review_thread before merging. If you genuinely disagree, reply with your reasoning then resolve.";
     } else if (
       reviewMatchesHead &&
       restSaysHasComments &&
+      resolved_thread_count === 0 &&
       propagation_retries === 5
     ) {
-      // We waited for propagation and still got 0 — treat as suspicious.
+      // Waited 10s for ANY thread (resolved or not) to appear and got nothing
+      // — genuine propagation lag, refuse to merge until we can actually see
+      // the threads.
       gates.threads_resolved.ok = false;
-      gates.threads_resolved.hint = `Copilot's REST review reports ${status.comment_count} inline comments for HEAD ${headSha.slice(0, 7)}, but the reviewThreads GraphQL endpoint still returns 0 after ${propagation_retries * 2}s. This is the documented propagation lag and means thread data is unreliable — refuse to merge. Wait 30-60s and retry, or inspect the PR manually at ${prData.html_url}.`;
+      gates.threads_resolved.hint = `Copilot's REST review reports ${status.comment_count} inline comments for HEAD ${headSha.slice(0, 7)}, but the reviewThreads GraphQL endpoint returns 0 threads of any state (resolved or unresolved) after ${propagation_retries * 2}s. This is the documented propagation lag and means thread data is genuinely unreliable — refuse to merge. Wait 30-60s and retry, or inspect the PR manually at ${prData.html_url}.`;
     }
   }
 
@@ -1143,7 +1193,7 @@ async function safeMergePr({
 // ---------- MCP wiring ----------
 
 const server = new Server(
-  { name: "copilot-review-mcp", version: "0.6.0" },
+  { name: "copilot-review-mcp", version: "0.6.1" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
